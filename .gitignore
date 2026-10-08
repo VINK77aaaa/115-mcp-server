@@ -1,0 +1,19 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.env
+dist/
+build/
+src/*.egg-info/
+logs/
+
+# ---- 凭据与本地数据，绝不入库 ----
+115-cookies.txt
+*cookies*.txt
+115-login-raw.json
+115_qr_token.json
+115登录二维码.png
+115_qr_uid.txt
+mcp.local.json
