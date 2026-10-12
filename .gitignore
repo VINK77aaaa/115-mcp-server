@@ -9,6 +9,14 @@ build/
 src/*.egg-info/
 logs/
 
+# ---- 批量上传运行期产物（断点续传状态 / 日志）----
+_upload_state.json
+_upload_state.json.*.tmp
+_upload_log.jsonl
+_progress.jsonl
+_supervisor.log
+_run_auto.log
+
 # ---- 凭据与本地数据，绝不入库 ----
 115-cookies.txt
 *cookies*.txt

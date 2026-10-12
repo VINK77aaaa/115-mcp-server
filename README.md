@@ -39,6 +39,7 @@ python -m venv .venv
 - 搜索文件/目录
 - 创建目录
 - 上传本地文件到 115
+- **批量并发上传整棵目录树**（断点续传 / 自动降并发 / 卡死看门狗；适合几万文件、几百 GB 的素材迁移）
 - 下载 115 文件到本地
 - 移动、复制、重命名、删除文件或目录
 - 批量移动、批量复制、批量删除
@@ -148,6 +149,25 @@ P115_ALLOW_QRCODE_LOGIN=false
 P115_CONSOLE_QRCODE=false
 FASTMCP_TRANSPORT=stdio
 ```
+
+### 批量上传（可选）
+
+只有使用 `batch_upload` / `batch_upload_plan` 时才需要这些变量；
+不设置时单文件 `upload_local_file` 行为完全不变。
+
+```env
+UPLOAD_ROOT=C:\material
+UPLOAD_PARENT_CID=3538089913171838179
+UP_CONC=4
+UPLOAD_WORKDIR=C:\material\_work
+UP_CHUNK_MB=8
+UP_CONNECT_TIMEOUT=30
+UP_READ_TIMEOUT=180
+UP_WATCHDOG_SEC=300
+UP_MAX_RETRY=5
+```
+
+完整说明见 **[docs/BATCH-UPLOAD.md](docs/BATCH-UPLOAD.md)**。
 
 这些变量应通过以下任一方式提供：
 
@@ -328,9 +348,22 @@ http://127.0.0.1:8000/mcp
 
 ```text
 src/mcp_115_server/
-  config.py      # 环境变量与服务配置
-  service.py     # 115 业务封装层
-  server.py      # FastMCP 工具注册与服务入口
+  config.py        # 环境变量与服务配置
+  service.py       # 115 业务封装层
+  server.py        # FastMCP 工具注册与服务入口
+  uploader.py      # 批量上传核心：超时注入 / 看门狗 / 限流识别 / 断点续传状态
+  batch.py         # 批量编排：两阶段（串行建树 → 线程池上传）+ 自动降并发
+  supervisor.py    # 崩溃重启监督器 + Windows 计划任务注册
+  batch_upload.py  # 命令行入口：python -m mcp_115_server.batch_upload
+docs/
+  PITFALLS.md      # 17 个项目踩坑记录
+  BATCH-UPLOAD.md  # 批量上传完整指南
+bench/
+  storage_read_ceiling.py   # 测存储侧单线程读取上限
+  conc_test.py              # 小文件并发阈值测试
+  conc_test_real.py         # 真实素材并发测试
+tools/
+  nic_speed.py     # 独立测本机网卡上行速率
 tests/
   test_service.py
 scripts/
@@ -391,6 +424,8 @@ scripts/
 - `list_share_access_users`
 - `get_share_download_quota`
 - `upload_local_file`
+- `batch_upload_plan`
+- `batch_upload`
 - `download_file`
 - `move_entry`
 - `batch_move_entries`
@@ -607,6 +642,58 @@ scripts/
 
 - `get_account_info()`
 - `get_index_info(include_space_numbers=true)`
+
+### 12. 批量并发上传（重点能力）
+
+面向**海量素材迁移**：整棵本地目录树 → 115，带断点续传、自动降并发、
+卡死看门狗、115 限流识别。来自真实项目「8 572 文件 / 640 GB ARRI 原始素材」的实战沉淀。
+
+```text
+# 1) 先出计划（不触网、不上传）
+batch_upload_plan(local_root="C:\\material", only=["ALEXA 65"])
+# -> { "trees": [{ "name": "ALEXA 65", "files": 1734, "bytes": 11927617536 }],
+#      "total_files": 1734, "total_bytes": 11927617536 }
+
+# 2) 再上传（长耗时；建议按子目录分批调用）
+batch_upload(local_root="C:\\material",
+             parent_cid="3538089913171838179",
+             only=["ALEXA 65"],
+             concurrency=4)
+```
+
+行为要点：
+
+- **幂等**：状态文件 `_upload_state.json` 记录已完成文件，重跑自动跳过，中断/崩溃后可安全重启。
+- **限流感知**：115 限流时 HTTP 仍是 200、body 里是 `code 770004`——引擎会识别并退避。
+- **自动降并发**：某批失败过半时并发自动减半（下限 1），而不是硬扛报错。
+- **超时兜底**：p115client 底层**没有任何超时**，本引擎显式注入 `Timeout(connect, read)`。
+- **看门狗**：`reporthook` 进展 **与** 网卡上行**双双**为零才判卡死——避免大文件算 SHA1 阶段被误杀。
+
+并发实测（6.88 MB/文件，干净样本）：
+
+| 并发 | 吞吐 | 倍率 |
+|---|---|---|
+| 1 | 8.9 MB/s | 1.00× |
+| 4 | 20.6 MB/s | 2.5× |
+| 8 | 30.2 MB/s | 3.4× |
+| 16 / 24 | 无提升 | — |
+| 32 | 报错 | — |
+
+瓶颈是**存储侧单线程读取上限（约 28 MB/s）**，不在网络。`UP_CONC=4` 是性价比拐点，8 是天花板。
+
+命令行与无人值守用法：
+
+```bash
+python -m mcp_115_server.batch_upload --root C:\material --dry-run
+python -m mcp_115_server.batch_upload --root C:\material --parent-cid 3538089913171838179 --conc 4
+```
+
+> **⚠ 长时间后台运行必须由操作系统级调度器拉起**（Windows 计划任务 / systemd / launchd）。
+> 普通父进程 spawn 出的子进程会随父进程被整组杀掉，`nohup` / `DETACHED_PROCESS` 都无效。
+
+完整说明（环境变量、断点续传、监督器、基准脚本、FAQ）见
+**[docs/BATCH-UPLOAD.md](docs/BATCH-UPLOAD.md)**；
+17 个踩坑记录见 **[docs/PITFALLS.md](docs/PITFALLS.md)**。
 
 ## 目标定位规则
 

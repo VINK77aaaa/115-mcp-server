@@ -456,6 +456,33 @@ def create_server(service: P115Service | None = None) -> FastMCP:
         )
 
     @mcp.tool
+    def batch_upload_plan(
+        local_root: str,
+        only: list[str] | None = None,
+    ) -> dict:
+        """Preview a batch upload: list sub-directories, file counts and sizes (no network)."""
+        return bound_service.batch_upload_plan(local_root, only=only)
+
+    @mcp.tool
+    def batch_upload(
+        local_root: str,
+        parent_cid: str | None = None,
+        only: list[str] | None = None,
+        concurrency: int | None = None,
+    ) -> dict:
+        """Upload a local directory tree to 115 with concurrency and resume support.
+
+        Long-running. Prefer calling it per sub-directory via `only` for large sets,
+        so progress is observable. Re-running is safe: already-uploaded files are skipped.
+        """
+        return bound_service.batch_upload(
+            local_root,
+            parent_cid=parent_cid,
+            only=only,
+            concurrency=concurrency,
+        )
+
+    @mcp.tool
     def move_entry(
         source_id: str | None = None,
         source_path: str | None = None,

@@ -19,8 +19,14 @@ dependencies = [
   "yarl>=1.23,<2",
 ]
 
+[project.optional-dependencies]
+# 批量上传的看门狗用 psutil 读本机网卡上行速率（双指标判卡死）。
+# 缺失时自动退化为单指标，不影响功能。
+upload = ["psutil>=5.9"]
+
 [project.scripts]
 115-MCP-Server = "mcp_115_server.server:main"
+115-batch-upload = "mcp_115_server.batch_upload:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

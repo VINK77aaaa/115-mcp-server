@@ -15,6 +15,38 @@
 
 实测本项目暴露 **58 个工具**，除上传外还多出回收站恢复、分享接收、目录遍历/glob、路径解析等能力。
 
+## 本仓库的额外扩展：批量并发上传
+
+在 `upload_local_file`（单文件）之外，本仓库**另外内置了一套批量上传引擎**，
+用于把整棵目录树推到 115。它来自一次真实迁移：**8 572 个文件 / 640 GB ARRI 原始素材**
+（NAS → 115），在 115 开放平台的限流环境下跑通。
+
+新增 2 个 MCP 工具：
+
+- `batch_upload_plan(local_root, only)` —— 出计划，**不触网**
+- `batch_upload(local_root, parent_cid, only, concurrency)` —— 真正上传，**长耗时**
+
+新增 4 个模块：`uploader.py`（核心）、`batch.py`（编排）、`supervisor.py`（崩溃重启）、
+`batch_upload.py`（命令行入口）。
+
+新增配置（均**可选**，不设置时单文件上传行为不变）：
+`UPLOAD_ROOT` / `UPLOAD_PARENT_CID` / `UP_CONC` / `UPLOAD_WORKDIR` /
+`UP_CHUNK_MB` / `UP_CONNECT_TIMEOUT` / `UP_READ_TIMEOUT` / `UP_WATCHDOG_SEC` / `UP_MAX_RETRY`。
+
+文档：
+
+- **[`docs/BATCH-UPLOAD.md`](docs/BATCH-UPLOAD.md)** —— 批量上传完整指南（环境变量、两种用法、断点续传、监督器、性能表、FAQ）
+- **[`docs/PITFALLS.md`](docs/PITFALLS.md)** —— **17 个坑**的完整记录，强烈建议先读
+
+几个最要命的坑（详见 PITFALLS）：
+
+1. `p115client` 底层的 `urllib3_future_request.request` **没有任何超时** —— TCP 半死时单个 PUT 会永久挂起。
+2. 115 限流时 **HTTP 仍是 200**，body 里才是 `code 770004` —— 只看 `data` 会把「限流」误判成「空目录」。
+3. `fs_files`（`webapi.115.com`）已**永久 405**，必须走 `fs_files_open`。
+4. 目录和文件的 id **都在 `fid` 字段**，不是 `cid`。
+5. 多线程并发写状态文件会抛 `RuntimeError: dictionary changed size during iteration` —— 必须锁 + 快照。
+6. **后台进程会被父进程整组杀掉**（Job Object），`nohup` / `DETACHED_PROCESS` 全无效，静默消失无日志 —— 必须用计划任务。
+
 ## 环境要求
 
 - Python **3.12+**（实测 3.13.12 可用）
@@ -153,12 +185,17 @@ cookie = ck if isinstance(ck, str) else "; ".join(f"{k}={v}" for k, v in ck.item
 
 ## 注意事项
 
-- **上传工具只支持单文件，没有目录递归**。备份整个目录需要自己遍历后逐个上传。
+- **单文件上传工具 `upload_local_file` 本身没有目录递归**；需要整目录上传请改用
+  `batch_upload`（见 `docs/BATCH-UPLOAD.md`）。
 - `client.user_space_info()` 在 `app="web"` 身份下会报 `errno 99 请重新登录`
   （它走的是 `/android/user/space_info`）。查容量改用 `get_storage_info` 或 `get_account_info`。
 - p115client 新 API 的字段名和旧文档不一致：文件列表用 `n`(名称) / `cid`(ID) / `fc`(0=目录)，
   不是老版的 `fn` / `fid`。
+  > 注：这一条只适用于旧版 `fs_files` 系接口。`fs_files_open`（批量上传走的就是它）
+  > 返回里的 id 字段**目录和文件都在 `fid`** —— 两个接口的字段命名规则不同，别混用。
 - 调用 115 接口时若本机有代理，建议清空代理环境变量，否则可能被拦。
+- `P115Client` **不是线程安全的**：并发查询实测 8/8 失败（即使每个线程独立建实例）。
+  批量上传的做法是「元数据查询全部主线程串行 + 线程池只搬数据」。
 
 ## 已验证记录
 
@@ -166,4 +203,10 @@ cookie = ck if isinstance(ck, str) else "; ".join(f"{k}={v}" for k, v in ck.item
 
 - 扫码登录成功，凭据字段 `UID / CID / SEID / KID`
 - 上传 62 字节测试文件 → 返回 `file_id` → 列表确认存在 → `fs_delete` 删除 → 列表确认已消失
-- MCP 服务以 stdio 启动正常，`tools/list` 返回 58 个工具，含 `upload_local_file`
+- MCP 服务以 stdio 启动正常，`tools/list` 返回 60 个工具（含新增 `batch_upload_plan` / `batch_upload`）
+- 批量上传：`batch_upload_plan` 对 51 文件 / 104697 字节的子树返回正确统计；
+  `fs_list` 返回 `state=True` 并读到 `ARRIRAW` 目录；`save_state` / `load_state` 往返一致
+- 修掉上游 `service.py` 里 `P115Client(**check_for_relogin=...)` 引发的
+  `TypeError: unexpected keyword argument`（该问题会导致**整个服务起不来**）；
+  现由 `_build_client()` 用 `inspect.signature` 过滤参数，兼容不同 p115client 版本
+- 并发吞吐实测（6.88 MB/文件）：并发 1 → 8.9 MB/s，4 → 20.6，8 → 30.2；16/24 无提升，32 报错

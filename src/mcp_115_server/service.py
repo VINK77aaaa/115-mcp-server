@@ -88,6 +88,29 @@ def _is_programming_error(exc: Exception) -> bool:
     return isinstance(exc, _PROGRAMMING_ERRORS) or isinstance(getattr(exc, "__cause__", None), _PROGRAMMING_ERRORS)
 
 
+def _build_client(cookies_source, **kwargs) -> P115Client:
+    """构造 P115Client，**容忍不同版本的参数差异**。
+
+    ``p115client`` 各版本支持的构造参数不完全一致。例如较新的
+    ``check_for_relogin`` / ``console_qrcode`` 在旧版里不存在，
+    直接传会抛 ``TypeError: __init__() got an unexpected keyword argument``，
+    导致**整个服务起不来**。
+    这里按「支持的参数才传」逐个裁剪，保证跨版本可用。
+    """
+    try:
+        import inspect
+
+        accepted = set(inspect.signature(P115Client.__init__).parameters)
+    except (TypeError, ValueError):
+        accepted = set()
+
+    filtered = {k: v for k, v in kwargs.items() if not accepted or k in accepted}
+    dropped = sorted(set(kwargs) - set(filtered))
+    if dropped:
+        logger.info("P115Client 不支持这些参数，已忽略: %s", ", ".join(dropped))
+    return P115Client(cookies_source, **filtered)
+
+
 class OfflineClearScope(StrEnum):
     COMPLETED = "completed"
     ALL = "all"
@@ -1251,6 +1274,132 @@ class P115Service:
             "bytes_written": written,
         }
 
+    # ------------------------------------------------------------------
+    # 批量上传（batch upload）
+    #
+    # 单文件 upload_local_file 是 MCP 原生能力；这里补的是「整棵树 + 并发 +
+    # 断点续传」——官方 MCP 缺的正是这块。实现见同包 uploader.py / batch.py。
+    # ------------------------------------------------------------------
+    def _upload_config(self) -> Any:
+        from .uploader import UploaderConfig
+
+        settings = self.settings
+        return UploaderConfig(
+            chunk=settings.upload_chunk_mb * 1024 * 1024,
+            connect_timeout=settings.upload_connect_timeout,
+            read_timeout=settings.upload_read_timeout,
+            watchdog_sec=settings.upload_watchdog_sec,
+            max_retry=settings.upload_max_retry,
+        )
+
+    def batch_upload_plan(
+        self,
+        local_root: str,
+        *,
+        only: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """列出将要上传的子树（不触网，不上传）。"""
+        from .uploader import walk_tree
+
+        root = Path(local_root).expanduser().resolve()
+        if not root.is_dir():
+            raise ToolError(f"Local directory does not exist: {root}")
+        names = only or sorted(
+            entry.name for entry in root.iterdir() if entry.is_dir()
+        )
+        trees = []
+        for name in names:
+            sub = root / name
+            if not sub.is_dir():
+                continue
+            items = walk_tree(str(sub))
+            trees.append({
+                "name": name,
+                "files": len(items),
+                "bytes": sum(item[2] for item in items),
+            })
+        return {
+            "local_root": str(root),
+            "parent_cid": self.settings.upload_parent_cid,
+            "concurrency": self.settings.upload_conc,
+            "trees": trees,
+            "total_files": sum(t["files"] for t in trees),
+            "total_bytes": sum(t["bytes"] for t in trees),
+        }
+
+    def batch_upload(
+        self,
+        local_root: str,
+        *,
+        parent_cid: str | None = None,
+        only: list[str] | None = None,
+        concurrency: int | None = None,
+    ) -> dict[str, Any]:
+        """把本地目录树并发上传到 115（幂等、断点续传）。
+
+        ⚠ 这是**长耗时**操作：大素材可能出现「传了几小时才返回」。
+        建议对超大目录分批调用（用 ``only`` 指定子目录），便于观察进度。
+
+        Args:
+            local_root: 本地根目录；其下每个子目录作为一个远端目录。
+            parent_cid: 115 目标父目录 id；默认取 ``UPLOAD_PARENT_CID``。
+            only: 只上传指定子目录名（可多选）。
+            concurrency: 多文件并发度；默认取 ``UP_CONC``（推荐 4~8）。
+        """
+        from .batch import BatchUploader
+        from .uploader import UploadPaths
+
+        root = Path(local_root).expanduser().resolve()
+        if not root.is_dir():
+            raise ToolError(f"Local directory does not exist: {root}")
+
+        parent = parent_cid if parent_cid is not None else self.settings.upload_parent_cid
+        parent = str(parent)
+        conc = int(concurrency if concurrency is not None else self.settings.upload_conc)
+
+        names = only or sorted(
+            entry.name for entry in root.iterdir() if entry.is_dir()
+        )
+        if not names:
+            raise ToolError(f"No sub-directories found under: {root}")
+
+        uploader = BatchUploader(
+            self.client(),
+            self._upload_config(),
+            UploadPaths(self.settings.upload_workdir_path),
+            conc=conc,
+            quiet=True,
+        )
+        results = []
+        totals = {"ok": 0, "skip": 0, "fail": 0, "bytes_uploaded": 0}
+        for name in names:
+            sub = root / name
+            if not sub.is_dir():
+                continue
+            outcome = uploader.upload_tree(str(sub), parent, name)
+            totals["ok"] += outcome["ok"]
+            totals["skip"] += outcome["skip"]
+            totals["fail"] += outcome["fail"]
+            totals["bytes_uploaded"] += outcome["bytes_uploaded"]
+            results.append({
+                "name": name,
+                "ok": outcome["ok"],
+                "skip": outcome["skip"],
+                "fail": outcome["fail"],
+                "dirs_built": outcome["dirs_built"],
+                "dir_fails": outcome["dir_fails"],
+                "elapsed_sec": round(outcome["elapsed"], 1),
+            })
+        return {
+            "local_root": str(root),
+            "parent_cid": parent,
+            "concurrency": conc,
+            "totals": totals,
+            "trees": results,
+            "state_file": uploader.paths.state,
+            "note": "Idempotent: re-running skips files already recorded in the state file.",
+        }
+
     def move_entry(
         self,
         *,
@@ -1489,10 +1638,10 @@ class P115Service:
             normalized = self._normalize_platform(platform)
             resolved_source = self._ensure_fresh_cookie_source(cookies_source)
             if normalized not in self._client_cache:
-                self._client_cache[normalized] = P115Client(
+                self._client_cache[normalized] = _build_client(
                     resolved_source,
-                    check_for_relogin=self.settings.p115_check_for_relogin,
                     app=normalized,
+                    check_for_relogin=self.settings.p115_check_for_relogin,
                     console_qrcode=self.settings.p115_console_qrcode,
                 )
             return self._client_cache[normalized]

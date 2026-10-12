@@ -14,6 +14,8 @@ hiddenimports = []
 hiddenimports += collect_submodules("fastmcp")
 hiddenimports += collect_submodules("p115client")
 hiddenimports += collect_submodules("pydantic_settings")
+# 批量上传看门狗用 psutil 读网卡上行（可选依赖，缺失时优雅退化）
+hiddenimports += collect_submodules("psutil")
 
 
 a = Analysis(
