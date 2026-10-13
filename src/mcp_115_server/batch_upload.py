@@ -15,6 +15,16 @@
 用法：
     python -m mcp_115_server.batch_upload --root /data/material --parent-cid 123
     python -m mcp_115_server.batch_upload --root /data/material --only "ALEXA 65"
+
+⭐ 零触网建树（强烈建议）
+    逐层列目录去建树，会把 115 的列目录接口打成限流（连打约 30 次即触发，
+    恢复要 20 分钟量级）。正确做法是先用 ``fs_search`` 把整棵树 dump 成
+    ``_dircache.json``，之后上传器建树/预取全部纯内存命中：
+
+        python -m mcp_115_server.batch_upload --root /data/material \
+            --parent-cid 123 --rebuild-dircache      # 一次性 dump（几十次搜索）
+
+    随后正常跑（不带该参数）即可 —— 启动时会自动 ``load_dir_cache``。
 """
 from __future__ import annotations
 
@@ -60,6 +70,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="状态文件与日志目录（默认当前目录）")
     ap.add_argument("--dry-run", action="store_true",
                     help="只列计划，不真正上传")
+    ap.add_argument("--rebuild-dircache", action="store_true",
+                    help="先用 fs_search 把 115 上的目录树 dump 成 _dircache.json"
+                         "（几十次搜索，代替 O(目录数) 次列目录），然后退出")
     args = ap.parse_args(argv)
 
     root = os.path.abspath(os.path.expanduser(args.root))
@@ -79,7 +92,42 @@ def main(argv: list[str] | None = None) -> int:
     print("目标父目录 cid : %s" % args.parent_cid)
     print("并发          : %d" % args.conc)
     print("状态文件      : %s" % paths.state)
+    print("目录缓存      : %s" % paths.dircache)
     print("待上传子目录  : %d 个" % len(names))
+
+    # ---- 可选：一次性 dump 115 上的目录树（零触网建树的前提）----
+    if args.rebuild_dircache:
+        from . import dircache as DC
+
+        # 顶层机型 cid 直接由「列一次父目录」得到，不需要硬编码
+        tops = {n: cid for n, (cid, size) in
+                U.remote_children(client, args.parent_cid).items()
+                if size is None}
+        roots = {n: tops[n] for n in names if n in tops}
+        missing = [n for n in names if n not in tops]
+        if missing:
+            print("  ! 115 上还没有这些顶层目录（首次上传时自动创建）：%s"
+                  % ", ".join(missing))
+        local_dirs = DC.scan_local_dirs(root, models=list(roots))
+        cache, report = DC.build_dir_cache(
+            client, roots, local_dirs=local_dirs,
+            log=lambda rec: U.log(rec, paths=paths))
+        for r in report:
+            print("  %-28s 目录 %3d/%3d  新建 %2d  搜索 %2d 次  命中 %3d 目录/%4d 文件  %.1fs"
+                  % (r["model"], r["dirs_resolved"], r["dirs_local"],
+                     r["dirs_created"], r["terms"], r["dir_hits"],
+                     r["file_hits"], r["seconds"]))
+        DC.write_cache(paths.dircache, cache)
+        print("  ✓ 目录缓存已写入 %s（%d 个 pid）" % (paths.dircache, len(cache)))
+        return 0
+
+    # ---- 启动时载入目录缓存：命中则建树/预取全程零触网 ----
+    n_cached = U.load_dir_cache(paths.dircache)
+    if n_cached:
+        print("  ✓ 已载入目录缓存：%d 个 pid（建树将零触网）" % n_cached)
+    else:
+        print("  ! 没有目录缓存；建树会逐层列目录，可能触发限流。"
+              "建议先跑一次 --rebuild-dircache。")
 
     if args.dry_run:
         for n in names:
@@ -96,7 +144,19 @@ def main(argv: list[str] | None = None) -> int:
         if not os.path.isdir(local):
             print("  ! 跳过（不是目录）：%s" % local)
             continue
-        r = up.upload_tree(local, args.parent_cid, n)
+        try:
+            r = up.upload_tree(local, args.parent_cid, n)
+        except U.AuthExpiredError as e:
+            # token 失效 → 非零退出，让监督器用【全新 client】重启。
+            # 因为状态与目录缓存都已落盘，重启是幂等且极廉价的。
+            print("\n✗ 115 access_token 失效，放弃本轮：%s" % str(e)[:200])
+            print("  （状态已落盘，重启后自动续传；若反复出现，"
+                  "请确认没有其它进程同时在用同一 cookie）")
+            return 2
+        except U.ListBlockedError as e:
+            print("\n✗ 列目录被限流/熔断，放弃本轮：%s" % str(e)[:200])
+            print("  （下一轮会自动重试；也可先跑 --rebuild-dircache）")
+            return 3
         for k in grand:
             grand[k] += r[k]
 

@@ -21,22 +21,26 @@
 用于把整棵目录树推到 115。它来自一次真实迁移：**8 572 个文件 / 640 GB ARRI 原始素材**
 （NAS → 115），在 115 开放平台的限流环境下跑通。
 
-新增 2 个 MCP 工具：
+新增 3 个 MCP 工具：
 
 - `batch_upload_plan(local_root, only)` —— 出计划，**不触网**
+- `rebuild_dir_cache(local_root, parent_cid, only)` —— ⭐ **零触网建树**，
+  用 `fs_search` 一次性枚举 115 子树并落盘（**强烈建议在上传前先跑**）
 - `batch_upload(local_root, parent_cid, only, concurrency)` —— 真正上传，**长耗时**
 
-新增 4 个模块：`uploader.py`（核心）、`batch.py`（编排）、`supervisor.py`（崩溃重启）、
-`batch_upload.py`（命令行入口）。
+新增 5 个模块：`uploader.py`（核心）、`dircache.py`（零触网建树）、
+`batch.py`（编排）、`supervisor.py`（崩溃重启）、`batch_upload.py`（命令行入口）。
 
 新增配置（均**可选**，不设置时单文件上传行为不变）：
 `UPLOAD_ROOT` / `UPLOAD_PARENT_CID` / `UP_CONC` / `UPLOAD_WORKDIR` /
-`UP_CHUNK_MB` / `UP_CONNECT_TIMEOUT` / `UP_READ_TIMEOUT` / `UP_WATCHDOG_SEC` / `UP_MAX_RETRY`。
+`UP_CHUNK_MB` / `UP_CONNECT_TIMEOUT` / `UP_READ_TIMEOUT` / `UP_WATCHDOG_SEC` / `UP_MAX_RETRY` /
+`UP_LIST_RETRY` / `UP_LIST_RETRY_BASE` / `UP_SRC_COOLDOWN` / `UP_LIST_BLOCK_SEC` /
+`UP_LIST_WAIT_MAX` / `UP_DIR_FAIL_TTL`。
 
 文档：
 
 - **[`docs/BATCH-UPLOAD.md`](docs/BATCH-UPLOAD.md)** —— 批量上传完整指南（环境变量、两种用法、断点续传、监督器、性能表、FAQ）
-- **[`docs/PITFALLS.md`](docs/PITFALLS.md)** —— **17 个坑**的完整记录，强烈建议先读
+- **[`docs/PITFALLS.md`](docs/PITFALLS.md)** —— **24 个坑**的完整记录，强烈建议先读（时间只够读一条 → 读**坑 18**）
 
 几个最要命的坑（详见 PITFALLS）：
 
@@ -46,6 +50,14 @@
 4. 目录和文件的 id **都在 `fid` 字段**，不是 `cid`。
 5. 多线程并发写状态文件会抛 `RuntimeError: dictionary changed size during iteration` —— 必须锁 + 快照。
 6. **后台进程会被父进程整组杀掉**（Job Object），`nohup` / `DETACHED_PROCESS` 全无效，静默消失无日志 —— 必须用计划任务。
+7. ⭐ **真正的瓶颈是「发现状态的代价」**：逐层列目录 = O(目录数) 次请求，
+   而 115 的列目录接口连打约 30 次就触发账号级限流（恢复 >20 分钟），
+   实测吞吐被压到 **0.53 文件/秒**。用 `fs_search` 递归枚举 + 落盘缓存后，
+   同样的任务跑到 **4.5+ 文件/秒**（近 9 倍）。见坑 18。
+8. `aps.115.com` 带 cookie 会被 **WAF 拦成 HTTP 405**（不带 cookie 反而 200），
+   且**不会自己恢复** —— 别把它当「永远可用的兜底」。
+9. `P115Client` 继承自 `P115OpenClient`，cookie 版 client 调 open 方法会**实时换 token**，
+   多个进程同时用同一个 cookie 会**互相顶掉** → `40140125 access_token 无效`。
 
 ## 环境要求
 
@@ -203,10 +215,20 @@ cookie = ck if isinstance(ck, str) else "; ".join(f"{k}={v}" for k, v in ck.item
 
 - 扫码登录成功，凭据字段 `UID / CID / SEID / KID`
 - 上传 62 字节测试文件 → 返回 `file_id` → 列表确认存在 → `fs_delete` 删除 → 列表确认已消失
-- MCP 服务以 stdio 启动正常，`tools/list` 返回 60 个工具（含新增 `batch_upload_plan` / `batch_upload`）
+- MCP 服务以 stdio 启动正常，`tools/list` 返回 61 个工具
+  （含新增 `batch_upload_plan` / `rebuild_dir_cache` / `batch_upload`）
 - 批量上传：`batch_upload_plan` 对 51 文件 / 104697 字节的子树返回正确统计；
   `fs_list` 返回 `state=True` 并读到 `ARRIRAW` 目录；`save_state` / `load_state` 往返一致
 - 修掉上游 `service.py` 里 `P115Client(**check_for_relogin=...)` 引发的
   `TypeError: unexpected keyword argument`（该问题会导致**整个服务起不来**）；
   现由 `_build_client()` 用 `inspect.signature` 过滤参数，兼容不同 p115client 版本
 - 并发吞吐实测（6.88 MB/文件）：并发 1 → 8.9 MB/s，4 → 20.6，8 → 30.2；16/24 无提升，32 报错
+- **零触网建树**：`fs_search`（`search_value` + `cur=0`）递归枚举 346 个目录，
+  只用 **48 次搜索调用**；重建的目录树与本地 `os.scandir` 结果 **346/346 完全一致**。
+  把所有网络函数 monkeypatch 成「一调就抛」后，`ensure_dir` 仍能解析全部 346 个目录、
+  `wait_for_list` 0.000s 返回 —— 证明建树真的零触网
+- 加固逻辑单元测试 `tests/test_uploader_hardening.py`：**14 个用例全绿**
+  （多源冷却 / 全局熔断 / 单源不熔断 / 子树重建 / 分页回卷 / 端到端编排），
+  全部离线（假 client），不会触网、也不会把限流打出来
+- 吞吐对比（同一批素材）：改前 **0.53 文件/秒** → 改后 **4.5+ 文件/秒**（近 9 倍），
+  且 `rapid=true`（秒传命中）**100%**、零失败

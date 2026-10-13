@@ -152,7 +152,7 @@ FASTMCP_TRANSPORT=stdio
 
 ### 批量上传（可选）
 
-只有使用 `batch_upload` / `batch_upload_plan` 时才需要这些变量；
+只有使用 `batch_upload` / `batch_upload_plan` / `rebuild_dir_cache` 时才需要这些变量；
 不设置时单文件 `upload_local_file` 行为完全不变。
 
 ```env
@@ -165,6 +165,14 @@ UP_CONNECT_TIMEOUT=30
 UP_READ_TIMEOUT=180
 UP_WATCHDOG_SEC=300
 UP_MAX_RETRY=5
+
+# 限流 / 熔断（一般不用改；跑测试时务必把 UP_LIST_WAIT_MAX 设成 0）
+UP_LIST_RETRY=4
+UP_LIST_RETRY_BASE=2.0
+UP_SRC_COOLDOWN=600
+UP_LIST_BLOCK_SEC=900
+UP_LIST_WAIT_MAX=1800
+UP_DIR_FAIL_TTL=60
 ```
 
 完整说明见 **[docs/BATCH-UPLOAD.md](docs/BATCH-UPLOAD.md)**。
@@ -351,12 +359,13 @@ src/mcp_115_server/
   config.py        # 环境变量与服务配置
   service.py       # 115 业务封装层
   server.py        # FastMCP 工具注册与服务入口
-  uploader.py      # 批量上传核心：超时注入 / 看门狗 / 限流识别 / 断点续传状态
+  uploader.py      # 批量上传核心：超时注入 / 看门狗 / 多源列目录 + 熔断 / 断点续传状态
+  dircache.py      # 零触网建树：用 fs_search 一次性枚举 115 子树并落盘
   batch.py         # 批量编排：两阶段（串行建树 → 线程池上传）+ 自动降并发
   supervisor.py    # 崩溃重启监督器 + Windows 计划任务注册
   batch_upload.py  # 命令行入口：python -m mcp_115_server.batch_upload
 docs/
-  PITFALLS.md      # 17 个项目踩坑记录
+  PITFALLS.md      # 24 个项目踩坑记录
   BATCH-UPLOAD.md  # 批量上传完整指南
 bench/
   storage_read_ceiling.py   # 测存储侧单线程读取上限
@@ -366,6 +375,7 @@ tools/
   nic_speed.py     # 独立测本机网卡上行速率
 tests/
   test_service.py
+  test_uploader_hardening.py   # 限流/多源/熔断/零触网建树（全离线，假 client）
 scripts/
   run-stdio.ps1
   run-http.ps1
@@ -425,6 +435,7 @@ scripts/
 - `get_share_download_quota`
 - `upload_local_file`
 - `batch_upload_plan`
+- `rebuild_dir_cache`
 - `batch_upload`
 - `download_file`
 - `move_entry`
@@ -654,7 +665,14 @@ batch_upload_plan(local_root="C:\\material", only=["ALEXA 65"])
 # -> { "trees": [{ "name": "ALEXA 65", "files": 1734, "bytes": 11927617536 }],
 #      "total_files": 1734, "total_bytes": 11927617536 }
 
-# 2) 再上传（长耗时；建议按子目录分批调用）
+# 2) ⭐ 零触网建树（一次性，几十次搜索代替 O(目录数) 次列目录）
+rebuild_dir_cache(local_root="C:\\material",
+                  parent_cid="3538089913171838179", only=["ALEXA 65"])
+# -> { "pids": 356, "dircache": ".../_dircache.json",
+#      "trees": [{ "dirs_local": 230, "dirs_resolved": 230, "dirs_created": 0,
+#                  "terms": 17, "dir_hits": 230, "file_hits": 16926, "seconds": 8.4 }] }
+
+# 3) 再上传（长耗时；建议按子目录分批调用）
 batch_upload(local_root="C:\\material",
              parent_cid="3538089913171838179",
              only=["ALEXA 65"],
@@ -663,11 +681,20 @@ batch_upload(local_root="C:\\material",
 
 行为要点：
 
+- **零触网建树**：`rebuild_dir_cache` 用 `fs_search` 递归枚举 115 子树并落盘；
+  之后 `batch_upload` 建树 / 预取**全程零网络请求**。跳过这一步会把列目录接口
+  打成账号级限流，实测吞吐从 4.5+ 掉到 **0.53 文件/秒**。
 - **幂等**：状态文件 `_upload_state.json` 记录已完成文件，重跑自动跳过，中断/崩溃后可安全重启。
-- **限流感知**：115 限流时 HTTP 仍是 200、body 里是 `code 770004`——引擎会识别并退避。
+- **限流感知 + 全局熔断**：115 限流时 HTTP 仍是 200、body 里是 `code 770004`——
+  引擎显式识别，并**一次性全局熔断**（熔断期内零查询，在线查重降级为「直接传」，
+  115 自己判重），给 115 留出恢复窗口。
+- **多源列目录 + 单源冷却**：主源被限流时退到备用源；备用源被 WAF 拦（HTTP 405）
+  则进冷却，不再白撞。
 - **自动降并发**：某批失败过半时并发自动减半（下限 1），而不是硬扛报错。
 - **超时兜底**：p115client 底层**没有任何超时**，本引擎显式注入 `Timeout(connect, read)`。
 - **看门狗**：`reporthook` 进展 **与** 网卡上行**双双**为零才判卡死——避免大文件算 SHA1 阶段被误杀。
+- **失败比降级更安全**：限流期间宁可抛错放弃本轮，也**绝不**把文件倒进错误目录
+  （静默的数据放错位置比什么都不做坏得多）。
 
 并发实测（6.88 MB/文件，干净样本）：
 
@@ -684,6 +711,11 @@ batch_upload(local_root="C:\\material",
 命令行与无人值守用法：
 
 ```bash
+# ⭐ 强烈建议：先一次性 dump 目录树（几十次搜索，代替 O(目录数) 次列目录）
+python -m mcp_115_server.batch_upload --root C:\material \
+    --parent-cid 3538089913171838179 --rebuild-dircache
+
+# 之后正常跑（启动时自动 load_dir_cache，建树零触网）
 python -m mcp_115_server.batch_upload --root C:\material --dry-run
 python -m mcp_115_server.batch_upload --root C:\material --parent-cid 3538089913171838179 --conc 4
 ```
@@ -691,9 +723,15 @@ python -m mcp_115_server.batch_upload --root C:\material --parent-cid 3538089913
 > **⚠ 长时间后台运行必须由操作系统级调度器拉起**（Windows 计划任务 / systemd / launchd）。
 > 普通父进程 spawn 出的子进程会随父进程被整组杀掉，`nohup` / `DETACHED_PROCESS` 都无效。
 
+> **⚠ 别跳过 `--rebuild-dircache`。** 逐层列目录去建树，会把 115 的列目录接口
+> 打成账号级限流（连打约 30 次即触发，恢复要 20 分钟量级），
+> 实测吞吐会被压到 **0.53 文件/秒**。用 `fs_search` 一次性枚举后，
+> 同样的任务能跑到 **4.5+ 文件/秒**。
+
 完整说明（环境变量、断点续传、监督器、基准脚本、FAQ）见
 **[docs/BATCH-UPLOAD.md](docs/BATCH-UPLOAD.md)**；
-17 个踩坑记录见 **[docs/PITFALLS.md](docs/PITFALLS.md)**。
+24 个踩坑记录见 **[docs/PITFALLS.md](docs/PITFALLS.md)**
+（时间只够读一条的话，读 **坑 18**）。
 
 ## 目标定位规则
 
@@ -752,6 +790,20 @@ python -m mcp_115_server.batch_upload --root C:\material --parent-cid 3538089913
 ```bash
 ./.venv/Scripts/python -m unittest discover -s tests -v
 ```
+
+其中 `tests/test_uploader_hardening.py` **完全离线**（用假 client 精确模拟
+115 的返回与异常），覆盖：
+
+- 多源列目录 + 单源冷却（aps 被 WAF 拦后不再白撞）
+- 账号级限流的全局熔断（熔断期内零触网）
+- 单源限流**不**熔断、单源 token 失效**不**判致命
+- `fs_search` 子树枚举 + 按 `pid` 自顶向下重建、缺失目录补建
+- `wait_for_list` 的短路与探测解除熔断
+- 分页回卷防死循环
+- `BatchUploader.upload_tree` 端到端：建树 → 落盘 → 上传 → 限流时中止
+
+> ⚠ 跑测试请设 `UP_LIST_WAIT_MAX=0`，否则等待类断言会真的进轮询循环，
+> 进程赖着不走并抢走线上任务的 token（见 PITFALLS 坑 23）。
 
 ## 本地打包为 Windows exe
 

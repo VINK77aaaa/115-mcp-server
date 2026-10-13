@@ -483,6 +483,26 @@ def create_server(service: P115Service | None = None) -> FastMCP:
         )
 
     @mcp.tool
+    def rebuild_dir_cache(
+        local_root: str,
+        parent_cid: str | None = None,
+        only: list[str] | None = None,
+    ) -> dict:
+        """Build the remote directory cache in one pass (STRONGLY RECOMMENDED first step).
+
+        Lists the whole 115 subtree under `parent_cid` using `fs_search` (recursive,
+        a few dozen calls) instead of listing directory-by-directory (O(#dirs) calls,
+        which trips 115's account-level rate limit after ~30 calls and takes >20 min
+        to recover). Writes `_dircache.json`; later `batch_upload` calls load it and
+        build the tree with ZERO network requests. Idempotent — safe to re-run.
+        """
+        return bound_service.rebuild_dir_cache(
+            local_root,
+            parent_cid=parent_cid,
+            only=only,
+        )
+
+    @mcp.tool
     def move_entry(
         source_id: str | None = None,
         source_path: str | None = None,

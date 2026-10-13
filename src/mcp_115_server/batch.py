@@ -119,6 +119,18 @@ class BatchUploader:
             self._say("  （空目录，跳过）")
             return result
 
+        # ⭐ 建树【之前】必须确认「列目录可用」。
+        #   限流期间 ensure_dir 每一步都会失败，最后退化成「退回父目录」，
+        #   把整棵树的文件倒进机型根目录 —— 静默的数据放错位置，
+        #   比「本轮什么都不做」坏得多。
+        #   ⚠ 如果调用方已经 U.load_dir_cache()，这里会立刻短路返回（零触网）。
+        if not U.wait_for_list(self.client, parent_cid, tag=model, cfg=self.cfg):
+            if U.fatal_reason() is not None:
+                raise U.AuthExpiredError(U.fatal_reason())
+            raise U.ListBlockedError(
+                "列目录接口在 %.0fs 内未恢复，放弃本轮（状态已落盘，下一轮续传）"
+                % self.cfg.list_wait_max)
+
         root_cid = U.ensure_dir(self.client, parent_cid, model)
 
         # ---- 阶段 1：只按【目录】建树 ----
@@ -143,6 +155,8 @@ class BatchUploader:
                 continue
             try:
                 dircache[chain] = U.ensure_dir(self.client, parent, chain[-1])
+            except U.AuthExpiredError:
+                raise                              # token 失效：立刻中止本轮
             except Exception as e:                 # noqa: BLE001 - 单目录失败不该中断
                 build_fails += 1
                 U.log({"t": time.strftime("%F %T"), "remote_name": model,
@@ -152,6 +166,23 @@ class BatchUploader:
         result["dir_fails"] = build_fails
         self._say("  [建树] %d 个目录节点（去重后），失败 %d"
                   % (result["dirs_built"], build_fails))
+
+        # ⚠ 建树大面积失败 = 列目录被限流/熔断，而不是「目录真的不存在」。
+        #   这时绝不能带着残缺的 dircache 继续上传 —— 那会把文件倒进
+        #   机型根目录（静默的数据放错位置）。直接放弃本轮，下一轮重试。
+        if build_fails and U.list_blocked():
+            if U.fatal_reason() is not None:
+                raise U.AuthExpiredError(U.fatal_reason())
+            raise U.ListBlockedError(
+                "列目录处于熔断期（%d/%d 个目录建失败），放弃本轮以免放错位置；"
+                "缓存已落盘，下一轮会从断点继续"
+                % (build_fails, len(dir_chains)))
+
+        # ⭐ 把建好的树落盘：下次重启就不必再逐层问 115（零触网建树）。
+        n_saved = U.save_dir_cache(self.paths.dircache)
+        if n_saved:
+            self._say("  [建树] 目录缓存已落盘：%d 个 pid -> %s"
+                      % (n_saved, self.paths.dircache))
 
         jobs = []
         for local, chain, size in items:
@@ -180,6 +211,8 @@ class BatchUploader:
                 with st_lock:
                     r = U.upload_one(self.client, local, pid, self.state, key,
                                      cfg=self.cfg)
+            except U.AuthExpiredError:
+                raise                              # token 失效：中止整轮，交给外层重启
             except Exception as e:                 # noqa: BLE001 - 单文件失败要记下继续
                 r = "fail:" + repr(e)[:120]
 

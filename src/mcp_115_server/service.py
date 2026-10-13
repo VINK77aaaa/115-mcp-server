@@ -1347,7 +1347,7 @@ class P115Service:
             concurrency: 多文件并发度；默认取 ``UP_CONC``（推荐 4~8）。
         """
         from .batch import BatchUploader
-        from .uploader import UploadPaths
+        from .uploader import UploadPaths, load_dir_cache
 
         root = Path(local_root).expanduser().resolve()
         if not root.is_dir():
@@ -1363,10 +1363,15 @@ class P115Service:
         if not names:
             raise ToolError(f"No sub-directories found under: {root}")
 
+        paths = UploadPaths(self.settings.upload_workdir_path)
+        # ⭐ 载入目录缓存：命中则建树 / 预取全程零触网，避免把列目录接口
+        #   打成账号级限流（770004）。缓存由 --rebuild-dircache 生成。
+        load_dir_cache(paths.dircache)
+
         uploader = BatchUploader(
             self.client(),
             self._upload_config(),
-            UploadPaths(self.settings.upload_workdir_path),
+            paths,
             conc=conc,
             quiet=True,
         )
@@ -1398,6 +1403,75 @@ class P115Service:
             "trees": results,
             "state_file": uploader.paths.state,
             "note": "Idempotent: re-running skips files already recorded in the state file.",
+        }
+
+    def rebuild_dir_cache(
+        self,
+        local_root: str,
+        *,
+        parent_cid: str | None = None,
+        only: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """⭐ 用 ``fs_search`` 一次性枚举 115 上的目录树，落盘成目录缓存。
+
+        **强烈建议在第一次批量上传之前先跑这个。** 逐层列目录去建树，
+        请求数是 O(目录数)，而 115 的列目录接口**连打约 30 次就会触发
+        账号级限流**（``code 770004``，恢复要 20 分钟量级）——
+        实测会把吞吐压到 0.53 文件/秒。
+
+        这里改用 ``fs_search``（带 ``search_value`` + ``cur=0`` 会**递归遍历
+        整棵子树**，目录项同时返回 ``cid`` 与 ``pid``），
+        把「发现状态」的请求数从 O(目录数) 降到几十次。
+
+        幂等，可随时重跑（换了素材目录、或 115 上手工加过目录之后）。
+
+        Args:
+            local_root: 本地根目录；其下每个子目录对应 115 上一个顶层目录。
+            parent_cid: 115 目标父目录 id；默认取 ``UPLOAD_PARENT_CID``。
+            only: 只处理指定子目录名（可多选）。
+        """
+        from . import dircache as DC
+        from . import uploader as U
+
+        root = Path(local_root).expanduser().resolve()
+        if not root.is_dir():
+            raise ToolError(f"Local directory does not exist: {root}")
+
+        parent = parent_cid if parent_cid is not None else self.settings.upload_parent_cid
+        parent = str(parent)
+        names = only or sorted(
+            entry.name for entry in root.iterdir() if entry.is_dir()
+        )
+        if not names:
+            raise ToolError(f"No sub-directories found under: {root}")
+
+        client = self.client()
+        paths = U.UploadPaths(self.settings.upload_workdir_path)
+
+        # 顶层目录 cid 直接「列一次父目录」拿到，不需要硬编码
+        tops = {n: cid for n, (cid, size) in
+                U.remote_children(client, parent).items() if size is None}
+        roots = {n: tops[n] for n in names if n in tops}
+        if not roots:
+            raise ToolError(
+                "115 上还没有这些顶层目录。请先跑一次 batch_upload 让它自动创建，"
+                "或确认 parent_cid 是否正确。")
+
+        local_dirs = DC.scan_local_dirs(str(root), models=list(roots))
+        cache, report = DC.build_dir_cache(
+            client, roots, local_dirs=local_dirs,
+            log=lambda rec: U.log(rec, paths=paths),
+        )
+        DC.write_cache(paths.dircache, cache)
+        return {
+            "local_root": str(root),
+            "parent_cid": parent,
+            "dircache": paths.dircache,
+            "pids": len(cache),
+            "not_on_115_yet": [n for n in names if n not in tops],
+            "trees": report,
+            "note": ("目录缓存已落盘。之后的 batch_upload 会自动载入它，"
+                     "建树全程零网络请求。"),
         }
 
     def move_entry(
