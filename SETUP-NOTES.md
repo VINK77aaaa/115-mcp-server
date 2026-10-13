@@ -40,7 +40,7 @@
 文档：
 
 - **[`docs/BATCH-UPLOAD.md`](docs/BATCH-UPLOAD.md)** —— 批量上传完整指南（环境变量、两种用法、断点续传、监督器、性能表、FAQ）
-- **[`docs/PITFALLS.md`](docs/PITFALLS.md)** —— **24 个坑**的完整记录，强烈建议先读（时间只够读一条 → 读**坑 18**）
+- **[`docs/PITFALLS.md`](docs/PITFALLS.md)** —— **25 个坑**的完整记录，强烈建议先读（时间只够读一条 → 读**坑 18**）
 
 几个最要命的坑（详见 PITFALLS）：
 

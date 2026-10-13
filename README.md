@@ -365,7 +365,7 @@ src/mcp_115_server/
   supervisor.py    # 崩溃重启监督器 + Windows 计划任务注册
   batch_upload.py  # 命令行入口：python -m mcp_115_server.batch_upload
 docs/
-  PITFALLS.md      # 24 个项目踩坑记录
+  PITFALLS.md      # 25 个项目踩坑记录
   BATCH-UPLOAD.md  # 批量上传完整指南
 bench/
   storage_read_ceiling.py   # 测存储侧单线程读取上限
@@ -730,7 +730,7 @@ python -m mcp_115_server.batch_upload --root C:\material --parent-cid 3538089913
 
 完整说明（环境变量、断点续传、监督器、基准脚本、FAQ）见
 **[docs/BATCH-UPLOAD.md](docs/BATCH-UPLOAD.md)**；
-24 个踩坑记录见 **[docs/PITFALLS.md](docs/PITFALLS.md)**
+25 个踩坑记录见 **[docs/PITFALLS.md](docs/PITFALLS.md)**
 （时间只够读一条的话，读 **坑 18**）。
 
 ## 目标定位规则

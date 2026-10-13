@@ -916,9 +916,17 @@ def upload_one(c, local, pid, st, key, cfg: UploaderConfig | None = None,
                  "elapsed": round(time.time() - t0, 1), "got_bytes": wd.total})
             if attempt == cfg.max_retry:
                 break
-            delay = min(cfg.retry_base * (2 ** (attempt - 1)), 120)
-            print("    ! 重试 %d/%d（等 %.0fs）%s"
-                  % (attempt, cfg.max_retry, delay, last_err[:90]))
+            # ⭐ 认证类错误（HTTP 401 / access_token / Unauthorized）立刻重试，
+            #   不要指数退避。这类失败与「链路拥塞」性质不同：退避只是白等，
+            #   而多个 worker 同时白等会把吞吐掉约 8%（线上实测）。
+            #   失败的那次调用本身已经走完了 p115client 的换 token 逻辑，
+            #   所以短等一下立刻重试基本都能过。详见 PITFALLS 坑 25。
+            is_auth = ("401" in last_err) or ("Unauthorized" in last_err) \
+                or ("access_token" in last_err)
+            delay = 0.5 if is_auth else min(cfg.retry_base * (2 ** (attempt - 1)), 120)
+            print("    ! 重试 %d/%d（等 %.1fs%s）%s"
+                  % (attempt, cfg.max_retry, delay,
+                     "，认证类快速重试" if is_auth else "", last_err[:80]))
             sys.stdout.flush()
             time.sleep(delay)
     st[key] = "fail"

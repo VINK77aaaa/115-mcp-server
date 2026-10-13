@@ -5,7 +5,7 @@
 在 115 开放平台的限流环境下跑通，最终沉淀为本仓库的 `mcp_115_server.uploader` /
 `batch` / `supervisor` 三个模块。
 
-> 所有「为什么这么写」的坑，都记在 [`PITFALLS.md`](./PITFALLS.md)（24 个坑，
+> 所有「为什么这么写」的坑，都记在 [`PITFALLS.md`](./PITFALLS.md)（25 个坑，
 > 时间只够读一条的话读**坑 18**）。
 > 本文只讲**怎么用**。
 
@@ -254,7 +254,7 @@ src/mcp_115_server/
   service.py        # 新增 batch_upload_plan() / batch_upload()
   server.py         # 新增 MCP 工具 batch_upload_plan / batch_upload
 docs/
-  PITFALLS.md       # 24 个坑的完整记录（强烈建议先读，尤其坑 18）
+  PITFALLS.md       # 25 个坑的完整记录（强烈建议先读，尤其坑 18）
   BATCH-UPLOAD.md   # 本文
 bench/
   storage_read_ceiling.py
